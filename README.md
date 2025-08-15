@@ -13,7 +13,7 @@ A high-performance GUI for refining neural spike sorting clusters from Kilosort 
 
 ```bash
 git clone https://github.com/kaissaradi/axolotl-wrapper.git
-cd axolotl
+cd axolotl-wrapper
 pip install -r requirements.txt
 python gui.py
 ```
