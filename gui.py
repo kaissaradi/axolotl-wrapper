@@ -1,13 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-axolotl GUI v3.5 (Refinement Implemented)
-Developer: 100x
-Date: 2025-08-14
-
-A high-performance GUI for neural spike sorting cluster refinement and visualization.
-This version re-implements the complete, multithreaded refinement and saving
-functionality into the corrected and streamlined UI.
-"""
 import sys
 import os
 import numpy as np
