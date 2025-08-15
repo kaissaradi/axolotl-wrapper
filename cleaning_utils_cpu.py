@@ -1,6 +1,7 @@
 # --- Standard Library Imports ---
 import os
 from pathlib import Path
+from typing import Tuple
 
 # --- Third-Party Imports ---
 import numpy as np
@@ -13,11 +14,91 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import correlate
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+from scipy.interpolate import griddata
 
 # --- Interactive Plotting Imports (for STA analysis) ---
 import ipywidgets as widgets
 from ipywidgets import HBox
 from IPython.display import display
+
+def compute_per_spike_features(
+    snippets: np.ndarray,
+    channel_positions: np.ndarray,
+    n_pcs: int = 3
+) -> np.ndarray:
+    """
+    Computes waveform and spatial features for each spike in a vectorized manner.
+
+    This function calculates the first N principal components (PCs) of the spike
+    waveform and the spatial center of mass (COM) for each spike. The COM is
+    weighted by the peak-to-peak (PTP) amplitude on each channel.
+
+    Parameters
+    ----------
+    snippets : np.ndarray
+        A 3D array of spike snippets of shape `(n_channels, n_samples, n_spikes)`.
+    channel_positions : np.ndarray
+        A 2D array of channel coordinates of shape `(n_channels, 2)`.
+    n_pcs : int, optional
+        The number of principal components to compute for the waveform features.
+        Defaults to 3.
+
+    Returns
+    -------
+    np.ndarray
+        A 2D array of shape `(n_spikes, n_pcs + 2)` containing the concatenated
+        waveform (PC) and spatial (COM) features for each spike.
+
+    Notes
+    -----
+    The implementation is fully vectorized to ensure high performance, avoiding
+    explicit for-loops over spikes. It handles the reshaping and transposing
+    of the input `snippets` array to fit the requirements for PCA and for the
+    center of mass calculation.
+    """
+    # 1. Get dimensions and reshape snippets for feature computation
+    n_channels, n_samples, n_spikes = snippets.shape
+    
+    # Reshape for PCA: each spike's waveform is flattened into a single vector.
+    # Input shape: (n_channels, n_samples, n_spikes)
+    # Desired shape for PCA: (n_spikes, n_features) where n_features = n_channels * n_samples
+    waveforms_flat = snippets.reshape(n_channels * n_samples, n_spikes).T
+
+    # 2. Compute Waveform Features (PCA)
+    # Scikit-learn's PCA handles mean centering internally.
+    pca = PCA(n_components=n_pcs)
+    waveform_features = pca.fit_transform(waveforms_flat)
+
+    # 3. Compute Spatial Features (Center of Mass)
+    # Calculate Peak-to-Peak (PTP) amplitudes to use as "mass" for the COM.
+    # ptp() on axis=1 works on the (n_channels, n_samples, n_spikes) array.
+    # Resulting shape: (n_channels, n_spikes)
+    ptp_amplitudes = np.ptp(snippets, axis=1)
+
+    # The sum of masses (PTPs) is the denominator for the COM calculation.
+    # Shape: (n_spikes,)
+    sum_of_masses = np.sum(ptp_amplitudes, axis=0)
+    
+    # To prevent division by zero for spikes with no signal, we replace
+    # zero sums with a very small number. This is a safe way to handle it
+    # without affecting the COM of other spikes.
+    sum_of_masses[sum_of_masses == 0] = 1e-9
+
+    # The numerator is the weighted sum of channel positions.
+    # This is a matrix multiplication: (n_spikes, n_channels) @ (n_channels, 2)
+    # Resulting shape: (n_spikes, 2)
+    weighted_positions = ptp_amplitudes.T @ channel_positions
+    
+    # Divide the weighted positions by the sum of masses.
+    # The denominator needs to be reshaped for broadcasting: (n_spikes,) -> (n_spikes, 1)
+    spatial_features = weighted_positions / sum_of_masses[:, np.newaxis]
+
+    # 4. Concatenate waveform and spatial features
+    # np.hstack is suitable for concatenating 2D arrays column-wise.
+    # (n_spikes, n_pcs) + (n_spikes, 2) -> (n_spikes, n_pcs + 2)
+    all_features = np.hstack((waveform_features, spatial_features))
+
+    return all_features
 
 def extract_snippets(dat_path, spike_times, window=(-20, 60), n_channels=512, dtype='int16'):
     """
@@ -384,7 +465,6 @@ def analyze_cleaned_clusters(clusters,
     plt.show()
 
 
-
 def calculate_isi_violations(spike_times_samples, sampling_rate, refractory_period_ms=2.0):
     """
     Calculates the rate of refractory period violations for a spike train.
@@ -404,10 +484,6 @@ def calculate_isi_violations(spike_times_samples, sampling_rate, refractory_peri
     violation_rate = violation_count / len(isis_samples)
 
     return violation_rate
-
-# This function should be added to or replace the existing V2 function in cleaning_utils.py
-
-# cleaning_utils.py
 
 def refine_cluster_v2(spike_times, dat_path, channel_positions, params):
     """
@@ -431,10 +507,10 @@ def refine_cluster_v2(spike_times, dat_path, channel_positions, params):
     print(f"Input spikes: {len(spike_times)}")
     
     window = params.get('window', (-20, 60))
-    min_spikes = params.get('min_spikes', 100)
-    k_start = params.get('k_start', 8)
+    min_spikes = params.get('min_spikes', 500)
+    k_start = params.get('k_start', 3)
     k_refine = params.get('k_refine', 2)
-    ei_sim_threshold = params.get('ei_sim_threshold', 0.95)
+    ei_sim_threshold = params.get('ei_sim_threshold', 0.9)
     max_depth = params.get('max_depth', 10)
     
     print(f"Parameters: min_spikes={min_spikes}, k_start={k_start}, k_refine={k_refine}")
@@ -452,10 +528,10 @@ def refine_cluster_v2(spike_times, dat_path, channel_positions, params):
         print(f"Error: Unknown dat_path type: {type(dat_path)}")
         return []
 
-    min_spikes = params.get('min_spikes', 100)
-    k_start = params.get('k_start', 8)
+    min_spikes = params.get('min_spikes', 500)
+    k_start = params.get('k_start', 3)
     k_refine = params.get('k_refine', 2)
-    ei_sim_threshold = params.get('ei_sim_threshold', 0.95)
+    ei_sim_threshold = params.get('ei_sim_threshold', 0.9)
     max_depth = params.get('max_depth', 10)
 
     full_inds = np.arange(snips.shape[2])
@@ -494,7 +570,7 @@ def refine_cluster_v2(spike_times, dat_path, channel_positions, params):
         snips_centered = snips_sel - snips_sel.mean(axis=1, keepdims=True)
         flat = snips_centered.transpose(2, 0, 1).reshape(len(inds), -1)
         print(f"    → Computing PCA on {flat.shape[1]} features...")
-        pcs = PCA(n_components=10).fit_transform(flat)
+        pcs = PCA(n_components=5).fit_transform(flat)
         print(f"    → Running KMeans with {k} clusters...")
         labels = KMeans(n_clusters=k, n_init=10, random_state=42).fit_predict(pcs)
 
@@ -611,88 +687,6 @@ def refine_cluster_v2(spike_times, dat_path, channel_positions, params):
     
     return kept
 
-def plot_rich_ei(fig, ei, channel_positions, sampling_rate=20000, pre_samples=40):
-    """
-    Creates a rich, multi-panel EI visualization on a given matplotlib Figure.
-    Directly inspired by the ENHANCED plots in analysis.pdf (pages 6-8).
-    """
-    fig.clear()
-
-    # --- 1. Feature Extraction ---
-    peak_negative = ei.min(axis=1)
-    peak_times = ei.argmin(axis=1)
-    peak_times_ms = (peak_times - pre_samples) / sampling_rate * 1000
-    
-    # Apply spatial smoothing for the amplitude map
-    peak_negative_smooth = _spatial_smooth(peak_negative, channel_positions)
-    
-    # Define active channels
-    amplitude_threshold = np.percentile(np.abs(peak_negative), 80)
-    active_channels = np.abs(peak_negative) > amplitude_threshold
-    active_idx = np.where(active_channels)[0]
-
-    if active_channels.sum() == 0:
-        ax = fig.add_subplot(111)
-        ax.text(0.5, 0.5, "No significant channels found.", ha='center', va='center', color='white')
-        ax.set_facecolor('black')
-        return
-
-    # --- 2. Setup Enhanced Figure Layout ---
-    gs = fig.add_gridspec(2, 2, height_ratios=[3, 2], width_ratios=[1,1], hspace=0.3, wspace=0.3)
-    ax1 = fig.add_subplot(gs[0, 0])  # Smoothed Amplitude
-    ax2 = fig.add_subplot(gs[0, 1])  # Propagation Delay
-    ax3 = fig.add_subplot(gs[1, :]) # Waveform Heatmap (spanning both columns)
-
-    # --- 3. Panel 1: Smoothed Spatial Amplitude ---
-    scatter1 = ax1.scatter(
-        channel_positions[:, 0], channel_positions[:, 1],
-        c=peak_negative_smooth, cmap='RdBu_r', s=30,
-        vmin=np.percentile(peak_negative_smooth, 5),
-        vmax=np.percentile(peak_negative_smooth, 95)
-    )
-    fig.colorbar(scatter1, ax=ax1, label='Smoothed Peak Amp (uV)', shrink=0.8)
-    ax1.set_title('Spatial Amplitude')
-
-    # --- 4. Panel 2: Propagation Delay ---
-    scatter2 = ax2.scatter(
-        channel_positions[active_channels, 0], channel_positions[active_channels, 1],
-        c=peak_times_ms[active_channels],
-        cmap='viridis', s=80, edgecolor='white', linewidth=0.5
-    )
-    fig.colorbar(scatter2, ax=ax2, label='Time to Peak (ms)', shrink=0.8)
-    ax2.set_title('Spike Propagation')
-
-    # --- 5. Panel 3: Waveform Heatmap ---
-    time_axis_ms = (np.arange(ei.shape[1]) - pre_samples) / sampling_rate * 1000
-    if active_channels.sum() > 0:
-        sorted_channel_idx = active_idx[np.argsort(peak_times[active_idx])]
-        waveform_matrix = ei[sorted_channel_idx]
-        
-        im = ax3.imshow(waveform_matrix, aspect='auto', cmap='RdBu_r',
-                        vmin=-np.percentile(np.abs(waveform_matrix), 98),
-                        vmax=np.percentile(np.abs(waveform_matrix), 98),
-                        extent=[time_axis_ms[0], time_axis_ms[-1], len(sorted_channel_idx), 0])
-        
-        ax3.axvline(0, color='black', linestyle='--', alpha=0.8)
-        ax3.set_xlabel('Time (ms)')
-        ax3.set_ylabel('Channels (sorted by time)')
-        ax3.set_title('Waveform Heatmap')
-        fig.colorbar(im, ax=ax3, label='Amplitude (uV)', shrink=0.8, orientation='horizontal', pad=0.2)
-
-    # --- 6. Final Styling ---
-    for ax in [ax1, ax2]:
-        ax.scatter(channel_positions[:, 0], channel_positions[:, 1], c='#333333', s=10, alpha=0.5, zorder=-1)
-        ax.axis('equal')
-
-    for ax in [ax1, ax2, ax3]:
-        ax.set_facecolor('#1f1f1f')
-        ax.tick_params(colors='gray')
-        ax.xaxis.label.set_color('gray')
-        ax.yaxis.label.set_color('gray')
-        ax.title.set_color('white')
-        for spine in ax.spines.values():
-            spine.set_edgecolor('gray')
-
 def _spatial_smooth(values, positions, sigma=30):
     """Spatially smooth values based on channel positions, from analysis.pdf."""
     smoothed = np.zeros_like(values)
@@ -702,6 +696,156 @@ def _spatial_smooth(values, positions, sigma=30):
         smoothed[i] = np.sum(values * weights) / np.sum(weights)
     return smoothed
 
+def compute_spatial_features(ei, channel_positions, sampling_rate=20000, pre_samples=40):
+    """
+    Computes rich spatial features for the EI, including PTP, smoothed peaks,
+    and an interpolated grid for contour plotting.
+    """
+    # --- Existing Calculations ---
+    peak_negative = ei.min(axis=1)
+    peak_times = ei.argmin(axis=1)
+    peak_times_ms = (peak_times - pre_samples) / sampling_rate * 1000
+    peak_negative_smooth = _spatial_smooth(peak_negative, channel_positions)
+    amplitude_threshold = np.percentile(np.abs(peak_negative), 80)
+    active_channels = np.abs(peak_negative) > amplitude_threshold
+
+    # --- NEW: Peak-to-Peak Calculation ---
+    ptp_amps = np.ptp(ei, axis=1)
+
+    # --- NEW: Spatial Interpolation for Contours ---
+    # Create a regular grid to interpolate onto
+    grid_x, grid_y = np.mgrid[
+        channel_positions[:, 0].min():channel_positions[:, 0].max():200j,
+        channel_positions[:, 1].min():channel_positions[:, 1].max():200j
+    ]
+    # Interpolate the smoothed amplitude values onto the grid
+    grid_z = griddata(channel_positions, peak_negative_smooth, (grid_x, grid_y), method='cubic')
+
+    # --- Return all features in a dictionary ---
+    return {
+        'peak_negative_smooth': peak_negative_smooth,
+        'peak_times_ms': peak_times_ms,
+        'active_channels': active_channels,
+        'ptp_amps': ptp_amps,
+        'grid_x': grid_x,
+        'grid_y': grid_y,
+        'grid_z': grid_z,
+    }
+
+# This function should be in cleaning_utils_cpu.py
+
+def plot_rich_ei(fig, ei, channel_positions, spatial_features, sampling_rate=20000, pre_samples=20):
+    """
+    Creates a rich, multi-panel EI visualization on a given matplotlib Figure.
+    This version uses pre-computed features to draw contours and variable-sized markers,
+    providing a clear view of the neuron's electrical footprint.
+    (UPDATED with axis correction and visualization enhancements).
+
+    Args:
+        fig (matplotlib.figure.Figure): The figure object to draw on.
+        ei (np.ndarray): The electrical image (mean waveforms), shape (n_channels, n_samples).
+        channel_positions (np.ndarray): 2D coordinates of each channel.
+        spatial_features (dict): A dictionary containing pre-computed features from
+                                 the compute_spatial_features function.
+        sampling_rate (int): The recording's sampling rate in Hz.
+        pre_samples (int): The number of samples before the spike peak in the snippet window.
+                           **MODIFIED: Default changed to 20 to match snippet extraction.**
+    """
+    # Clear the figure to ensure we start fresh for each new cluster
+    fig.clear()
+
+    # --- 1. Extract all necessary pre-computed features from the dictionary ---
+    peak_negative_smooth = spatial_features['peak_negative_smooth']
+    ptp_amps = spatial_features['ptp_amps']
+    grid_x = spatial_features['grid_x']
+    grid_y = spatial_features['grid_y']
+    grid_z = spatial_features['grid_z']
+    peak_times_ms = spatial_features['peak_times_ms']
+    active_channels = spatial_features['active_channels']
+
+    # --- 2. Setup Enhanced Figure Layout using GridSpec ---
+    gs = fig.add_gridspec(2, 2, height_ratios=[3, 2], width_ratios=[1, 1], hspace=0.4, wspace=0.3)
+    ax1 = fig.add_subplot(gs[0, 0])  # Top-left: Enhanced Spatial Amplitude
+    ax2 = fig.add_subplot(gs[0, 1])  # Top-right: Propagation Delay
+    ax3 = fig.add_subplot(gs[1, :])   # Bottom: Waveform Heatmap (spans both columns)
+
+    # --- 3. Panel 1: Enhanced Spatial Amplitude Plot (The Core Improvement) ---
+    ax1.set_title('Spatial Amplitude (Soma/Axon)', color='white')
+
+    # --- NEW: Calculate robust color limits to prevent outliers from dominating the colormap ---
+    v_min = np.percentile(peak_negative_smooth, 5)
+    v_max = np.percentile(peak_negative_smooth, 95)
+
+    # Draw the smooth, filled contour plot with the new color limits
+    contour_fill = ax1.contourf(grid_x, grid_y, grid_z, levels=20, cmap='RdBu_r', alpha=0.7, vmin=v_min, vmax=v_max)
+
+    ax1.contour(grid_x, grid_y, grid_z, levels=20, colors='white', linewidths=0.5, alpha=0.4)
+
+    max_ptp = ptp_amps.max()
+    if max_ptp > 0:
+        scaled_sizes = 10 + (ptp_amps / max_ptp) * 250
+    else:
+        scaled_sizes = np.full_like(ptp_amps, 10)
+
+    # Draw the electrodes on top with new color limits
+    scatter1 = ax1.scatter(
+        channel_positions[:, 0], channel_positions[:, 1],
+        s=scaled_sizes,
+        c=peak_negative_smooth,
+        cmap='RdBu_r',
+        edgecolor='black',
+        linewidth=0.7,
+        zorder=2,
+        vmin=v_min, vmax=v_max # Apply robust color limits
+    )
+    fig.colorbar(contour_fill, ax=ax1, label='Smoothed Peak Amp (µV)', shrink=0.8)
+
+    # --- 4. Panel 2: Propagation Delay Plot ---
+    ax2.set_title('Spike Propagation', color='white')
+    scatter2 = ax2.scatter(
+        channel_positions[active_channels, 0], channel_positions[active_channels, 1],
+        c=peak_times_ms[active_channels],
+        cmap='viridis', s=80, edgecolor='white', linewidth=0.5
+    )
+    fig.colorbar(scatter2, ax=ax2, label='Time to Peak (ms)', shrink=0.8)
+
+    # --- 5. Panel 3: Waveform Heatmap ---
+    ax3.set_title('Waveform Heatmap (Sorted by Peak Time)', color='white')
+    # The time axis is now correct due to the updated pre_samples default value
+    time_axis_ms = (np.arange(ei.shape[1]) - pre_samples) / sampling_rate * 1000
+
+    if active_channels.sum() > 0:
+        active_idx = np.where(active_channels)[0]
+        peak_times_samples = ei.argmin(axis=1)
+        sorted_channel_idx = active_idx[np.argsort(peak_times_samples[active_idx])]
+        waveform_matrix = ei[sorted_channel_idx]
+
+        im = ax3.imshow(waveform_matrix, aspect='auto', cmap='RdBu_r',
+                        vmin=-np.percentile(np.abs(waveform_matrix), 98),
+                        vmax=np.percentile(np.abs(waveform_matrix), 98),
+                        extent=[time_axis_ms[0], time_axis_ms[-1], len(sorted_channel_idx), 0])
+
+        ax3.axvline(0, color='black', linestyle='--', alpha=0.8)
+        ax3.set_xlabel('Time (ms)', color='gray')
+        ax3.set_ylabel('Channels (sorted)', color='gray')
+        fig.colorbar(im, ax=ax3, label='Amplitude (µV)', shrink=0.8, orientation='horizontal', pad=0.25)
+    else:
+        ax3.text(0.5, 0.5, "No active channels to display", ha='center', va='center', color='gray')
+
+    # --- 6. Final Styling for all Panels ---
+    for ax in [ax1, ax2]:
+        # --- MODIFIED: Background electrodes are now smaller and more transparent ---
+        ax.scatter(channel_positions[:, 0], channel_positions[:, 1], c='#444444', s=5, alpha=0.2, zorder=1)
+        ax.axis('equal')
+        ax.set_facecolor('#1f1f1f')
+        ax.tick_params(colors='gray')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('gray')
+
+    ax3.set_facecolor('#1f1f1f')
+    ax3.tick_params(colors='gray')
+    for spine in ax3.spines.values():
+        spine.set_edgecolor('gray')
 
 
 def get_binned_spikes_from_kilosort(kilosort_path, target_cluster_id, M, protocol_id, noise_file_name, bins_per_frame=1, pre_filtered_spike_times=None):
@@ -786,10 +930,8 @@ def get_binned_spikes_from_kilosort(kilosort_path, target_cluster_id, M, protoco
     print(f"    Binned {np.sum(binned_spikes_final):.0f} spikes against {len(binned_spikes_final)} total bins.")
     return binned_spikes_final[:, np.newaxis], epoch_params, mean_frame_rate, unique_frames
 
-# Modularized STA plotting function
-
 def get_and_plot_sta_analysis(kilosort_output_path, target_cluster_id, raw_data_base_path, protocol_id, sta_depth, bins_per_frame, sample_rate, frame_offset,
-                              experiment_name=None, noise_file_name_list=None, sub_cluster_spike_times=None): # Added new parameters
+                              experiment_name=None, noise_file_name_list=None, sub_cluster_spike_times=None):
     """
     Performs STA analysis and generates interactive plots for a given Kilosort cluster or sub-cluster.
 
