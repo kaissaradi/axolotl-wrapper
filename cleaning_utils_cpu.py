@@ -133,7 +133,7 @@ def extract_snippets(dat_path, spike_times, window=(-20, 60), n_channels=512, dt
     # 3. Iterate through spikes and slice from the memory-mapped array.
     #    This is significantly faster than f.seek() and f.read() in a loop.
     for i, spike_time in enumerate(spike_times):
-        start_sample = spike_time + window[0]
+        start_sample = spike_time.astype(np.int64) + window[0]
         end_sample = start_sample + snip_len
 
         # Boundary check to ensure snippets are not read from outside the file
